@@ -38,10 +38,8 @@ const (
 	wsInitialReconnect  = time.Second
 
 	// WeCom requires finish=true within 6 minutes of the first stream frame.
-	// wsStreamTickInterval controls how often we send an in-progress hint.
 	// wsStreamMaxDuration is a safety margin below the 6-minute hard limit.
-	wsStreamTickInterval = 30 * time.Second
-	wsStreamMaxDuration  = 5*time.Minute + 30*time.Second
+	wsStreamMaxDuration = 5*time.Minute + 30*time.Second
 
 	// wsImageDownloadTimeout caps the time we spend downloading an inbound image.
 	wsImageDownloadTimeout = 30 * time.Second
@@ -286,6 +284,11 @@ func (c *WeComAIBotWSChannel) Send(ctx context.Context, msg bus.OutboundMessage)
 	// and there will be no matching entry in reqStates; fall through to proactive push.
 	task, route, ok := c.getReqState(msg.ChatID)
 	if !ok {
+		if !msg.Final {
+			// Intermediate message (tool feedback, etc.) with no active WS session.
+			// Nothing to stream to; silently drop it.
+			return nil
+		}
 		// No req_id record found — this is a cron/scheduler-originated message.
 		// Send it as a proactive markdown push using the chat ID directly.
 		logger.InfoCF("wecom_aibot", "Send: no req_id state, delivering via proactive push (cron/scheduler)",
@@ -299,6 +302,12 @@ func (c *WeComAIBotWSChannel) Send(ctx context.Context, msg bus.OutboundMessage)
 	}
 
 	if task == nil {
+		if !msg.Final {
+			// Intermediate message: stream for this req_id has already closed (deadline
+			// or new-message cancel).  Nothing to do.
+			return nil
+		}
+
 		if time.Now().Before(route.ReadyAt) {
 			// Keep using aibot_respond_msg within stream window; do not proactively
 			// push unless wsStreamMaxDuration has elapsed.
@@ -318,6 +327,19 @@ func (c *WeComAIBotWSChannel) Send(ctx context.Context, msg bus.OutboundMessage)
 		return nil
 	}
 
+	if !msg.Final {
+		// Intermediate message (tool feedback, context notices, etc.) with an active
+		// stream.  Send directly as a non-finishing stream chunk so the user sees
+		// live progress without touching answerCh (which the goroutine reserves for
+		// the single final answer).
+		for _, chunk := range splitWSContent(msg.Content, wsStreamMaxContentBytes) {
+			c.wsSendStreamChunk(task.ReqID, task.StreamID, false, chunk)
+		}
+		return nil
+	}
+
+	// Final answer: deliver to the waiting goroutine via answerCh, which will
+	// send it with finish=true and clean up the stream state.
 	// Non-blocking fast path: when answerCh has space, deliver without racing
 	// against task.ctx.Done() (which fires when the task is canceled by a new
 	// incoming message, but the response must still be sent).
@@ -852,37 +874,34 @@ func (c *WeComAIBotWSChannel) dispatchWSAgentTask(
 		c.HandleMessage(taskCtx, peer, reqID, userID, reqID,
 			content, mediaRefs, metadata, sender)
 
-		// Wait for the agent reply. While waiting, send periodic finish=false
-		// hints so the user knows processing is still in progress.
+		// Wait for the agent reply.
 		// WeCom requires finish=true within 6 minutes of the first stream frame;
 		// wsStreamMaxDuration enforces that limit with a safety margin.
-		waitHints := []string{
-			"⏳ Processing, please wait...",
-			"⏳ Still processing, please wait...",
-			"⏳ Almost there, please wait...",
-		}
-		ticker := time.NewTicker(wsStreamTickInterval)
-		defer ticker.Stop()
 		deadlineTimer := time.NewTimer(wsStreamMaxDuration)
 		defer deadlineTimer.Stop()
-		tickCount := 0
 		for {
 			select {
 			case answer := <-task.answerCh:
-				// Split the answer into byte-bounded chunks and send as stream frames.
-				// All but the last carry finish=false; the final frame closes the stream.
+
+				// Split the answer into byte-bounded chunks.
+				// Each chunk must fit within wsStreamMaxContentBytes (20480 bytes).
+				// WeCom's stream update semantics REPLACE content (not append), so all
+				// chunks beyond the first need a fresh stream.id — otherwise only the
+				// last chunk would be visible to the user.
+				//
+				// Delivery plan:
+				//   chunk[0] — close the already-opened stream (finish=true, same streamID)
+				//   chunk[1+] — create + immediately close a new stream per chunk
 				chunks := splitWSContent(answer, wsStreamMaxContentBytes)
 				for i, chunk := range chunks {
-					c.wsSendStreamChunk(reqID, streamID, i == len(chunks)-1, chunk)
+					sid := streamID
+					if i > 0 {
+						sid = wsGenerateID()
+					}
+					c.wsSendStreamChunk(reqID, sid, true, chunk)
 				}
 				c.deleteReqState(reqID)
 				return
-			case <-ticker.C:
-				hint := waitHints[tickCount%len(waitHints)]
-				tickCount++
-				logger.DebugCF("wecom_aibot", "Sending stream progress hint",
-					map[string]any{"chat_id": actualChatID, "tick": tickCount})
-				c.wsSendStreamChunk(reqID, streamID, false, hint)
 			case <-deadlineTimer.C:
 				logger.WarnCF("wecom_aibot",
 					"Stream response deadline reached, closing stream; late reply will be pushed",
@@ -1028,26 +1047,10 @@ func (c *WeComAIBotWSChannel) wsSendActivePush(chatID string, chatType uint32, c
 }
 
 // writeWSAndWait writes cmd to the active connection and validates the command response.
+// It is a thin wrapper around callWSCommand that discards the response body.
 func (c *WeComAIBotWSChannel) writeWSAndWait(cmd wsCommand, timeout time.Duration) error {
-	if cmd.Headers.ReqID == "" {
-		return fmt.Errorf("req_id is empty")
-	}
-
-	c.connMu.Lock()
-	conn := c.conn
-	c.connMu.Unlock()
-	if conn == nil {
-		return fmt.Errorf("websocket not connected")
-	}
-
-	resp, err := c.sendAndWait(conn, cmd.Headers.ReqID, cmd, timeout)
-	if err != nil {
-		return err
-	}
-	if resp.ErrCode != 0 {
-		return fmt.Errorf("%s rejected (errcode=%d): %s", cmd.Cmd, resp.ErrCode, resp.ErrMsg)
-	}
-	return nil
+	_, err := c.callWSCommand(cmd, timeout)
+	return err
 }
 
 // cancelAllTasks cancels every pending agent task; called when the connection drops.
